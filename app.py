@@ -225,26 +225,111 @@ EXPECTED_COLUMNS = {
 }
 
 
-@st.cache_data(show_spinner="Loading price data…")
-def load_data(source) -> pd.DataFrame:
-    """Load the energy price CSV from a path, uploaded file, or BytesIO."""
-    df = pd.read_csv(source)
+@st.cache_data(show_spinner="Loading and aggregating price data…")
+def load_and_aggregate(source) -> tuple[pd.DataFrame, dict]:
+    """Stream the hourly CSV in chunks and aggregate to daily swings on the fly.
 
-    missing = EXPECTED_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Missing expected columns: {missing}. Found: {list(df.columns)}"
-        )
+    This avoids holding the full hourly dataset (often hundreds of MB) in memory.
+    For each chunk we accumulate per-(country, date) min, max, sum, and count,
+    then combine across chunks at the end.
 
-    # Use local datetime — intraday swings are a local-time phenomenon
-    df["Datetime"] = pd.to_datetime(df["Datetime (Local)"], errors="coerce")
-    df = df.dropna(subset=["Datetime", "Price (EUR/MWhe)"])
-    df["Date"] = df["Datetime"].dt.date
-    df = df.rename(columns={"Price (EUR/MWhe)": "Price"})
-    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
-    df = df.dropna(subset=["Price"])
+    Returns a tuple of (daily_swings_df, metadata_dict).
+    """
+    CHUNK_SIZE = 200_000  # rows per chunk — keeps peak memory low
 
-    return df[["Country", "ISO3 Code", "Datetime", "Date", "Price"]]
+    # Per-key accumulators: keyed by (country, iso, date)
+    peak: dict = {}
+    trough: dict = {}
+    price_sum: dict = {}
+    hours: dict = {}
+
+    total_rows = 0
+    countries_seen: set = set()
+    header_checked = False
+
+    # Note: BytesIO needs to be rewound between reads, but pd.read_csv with
+    # chunksize handles it via a single iterator.
+    reader = pd.read_csv(
+        source,
+        chunksize=CHUNK_SIZE,
+        usecols=list(EXPECTED_COLUMNS),  # skip any extra columns Ember might add
+    )
+
+    for chunk in reader:
+        if not header_checked:
+            missing = EXPECTED_COLUMNS - set(chunk.columns)
+            if missing:
+                raise ValueError(
+                    f"Missing expected columns: {missing}. Found: {list(chunk.columns)}"
+                )
+            header_checked = True
+
+        # Parse + clean this chunk
+        chunk["Datetime"] = pd.to_datetime(chunk["Datetime (Local)"], errors="coerce")
+        chunk["Price"] = pd.to_numeric(chunk["Price (EUR/MWhe)"], errors="coerce")
+        chunk = chunk.dropna(subset=["Datetime", "Price"])
+        if chunk.empty:
+            continue
+
+        chunk["Date"] = chunk["Datetime"].dt.date
+        countries_seen.update(chunk["Country"].unique())
+        total_rows += len(chunk)
+
+        # Aggregate within this chunk first — turns ~200k rows into ~ N_countries * N_days_in_chunk rows
+        agg = chunk.groupby(
+            ["Country", "ISO3 Code", "Date"], sort=False
+        )["Price"].agg(["max", "min", "sum", "count"])
+
+        # Merge chunk aggregates into running accumulators
+        for (country, iso, date), row in agg.iterrows():
+            key = (country, iso, date)
+            row_max = row["max"]
+            row_min = row["min"]
+            row_sum = row["sum"]
+            row_count = row["count"]
+
+            if key in peak:
+                if row_max > peak[key]:
+                    peak[key] = row_max
+                if row_min < trough[key]:
+                    trough[key] = row_min
+                price_sum[key] += row_sum
+                hours[key] += row_count
+            else:
+                peak[key] = row_max
+                trough[key] = row_min
+                price_sum[key] = row_sum
+                hours[key] = row_count
+
+        # Free the chunk explicitly so memory drops between iterations
+        del chunk, agg
+
+    if not peak:
+        raise ValueError("No usable rows found in the data.")
+
+    # Materialize accumulators into a DataFrame
+    keys = list(peak.keys())
+    swings = pd.DataFrame(
+        {
+            "Country": [k[0] for k in keys],
+            "ISO3 Code": [k[1] for k in keys],
+            "Date": pd.to_datetime([k[2] for k in keys]),
+            "Peak": [peak[k] for k in keys],
+            "Trough": [trough[k] for k in keys],
+            "Hours": [hours[k] for k in keys],
+        }
+    )
+    swings["Mean"] = [price_sum[k] / hours[k] for k in keys]
+    swings["Swing"] = swings["Peak"] - swings["Trough"]
+
+    # Only keep days with reasonable coverage (≥ 20 hours of 24)
+    swings = swings[swings["Hours"] >= 20].reset_index(drop=True)
+
+    metadata = {
+        "total_rows": total_rows,
+        "countries": len(countries_seen),
+    }
+    return swings, metadata
 
 
 @st.cache_data(show_spinner="Downloading data from Ember (one-time, ~60s)…", ttl=24 * 3600)
@@ -267,22 +352,6 @@ def download_and_extract_zip(url: str) -> bytes:
             )
         with zf.open(csv_members[0]) as f:
             return f.read()
-
-
-@st.cache_data(show_spinner="Computing daily swings…")
-def compute_daily_swings(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate hourly prices into daily peak, trough, and swing per country."""
-    grouped = (
-        df.groupby(["Country", "ISO3 Code", "Date"])["Price"]
-        .agg(["max", "min", "mean", "count"])
-        .reset_index()
-        .rename(columns={"max": "Peak", "min": "Trough", "mean": "Mean", "count": "Hours"})
-    )
-    grouped["Swing"] = grouped["Peak"] - grouped["Trough"]
-    grouped["Date"] = pd.to_datetime(grouped["Date"])
-    # Only keep days with reasonable coverage (≥ 20 hours of 24)
-    grouped = grouped[grouped["Hours"] >= 20]
-    return grouped
 
 
 # ---------------------------------------------------------------------------
@@ -362,12 +431,10 @@ if source is None:
     st.stop()
 
 try:
-    df_raw = load_data(source)
+    swings, data_meta = load_and_aggregate(source)
 except Exception as e:
     st.error(f"Could not read the CSV: {e}")
     st.stop()
-
-swings = compute_daily_swings(df_raw)
 
 if swings.empty:
     st.error("No usable rows after cleaning. Check the input file.")
@@ -671,8 +738,8 @@ with footer_col1:
     st.caption(
         f"Dataset spans {data_min_date.strftime('%d %b %Y')} → "
         f"{data_max_date.strftime('%d %b %Y')} · "
-        f"{df_raw['Country'].nunique()} countries · "
-        f"{len(df_raw):,} hourly observations"
+        f"{data_meta['countries']} countries · "
+        f"{data_meta['total_rows']:,} hourly observations"
     )
 with footer_col2:
     st.caption(
