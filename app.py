@@ -418,7 +418,11 @@ if LOGO_PATH.exists():
 else:
     st.title("European Intraday Price Swings")
 st.caption(
-    "Daily peak-to-trough spreads in day-ahead electricity markets · EUR/MWh · local time"
+    "How much does the price of electricity move within a single day? "
+    "This dashboard shows the daily **peak-to-trough spread** — the gap between "
+    "the most expensive and cheapest hour — for European day-ahead power markets. "
+    "Wider swings mean more value for flexibility (batteries, demand shifting) "
+    "and bigger price differences for consumers across the day."
 )
 
 source = resolve_data_source()
@@ -487,21 +491,34 @@ end_ts = pd.Timestamp(end_date)
 
 countries_all = sorted(swings["Country"].unique())
 
-# Default: top 10 by mean swing in window for a sensible starting view
+# Default selection — only include names that actually appear in the dataset,
+# so this stays robust if Ember changes the country list.
+PREFERRED_DEFAULTS = [
+    "Netherlands",
+    "Germany",
+    "Poland",
+    "Estonia",
+    "Latvia",
+    "Lithuania",
+]
+default_countries = [c for c in PREFERRED_DEFAULTS if c in countries_all]
+
+# Fallback if none of the preferred ones are present: pick the top-swing countries
 window_mask = (swings["Date"] >= start_ts) & (swings["Date"] <= end_ts)
-default_top = (
-    swings[window_mask]
-    .groupby("Country")["Swing"]
-    .mean()
-    .sort_values(ascending=False)
-    .head(10)
-    .index.tolist()
-)
+if not default_countries:
+    default_countries = (
+        swings[window_mask]
+        .groupby("Country")["Swing"]
+        .mean()
+        .sort_values(ascending=False)
+        .head(6)
+        .index.tolist()
+    )
 
 selected_countries = st.sidebar.multiselect(
     "Countries",
     options=countries_all,
-    default=default_top if default_top else countries_all[:10],
+    default=default_countries if default_countries else countries_all[:6],
     help="Select one or more countries to compare.",
 )
 
@@ -521,11 +538,39 @@ if filtered.empty:
 # ---------------------------------------------------------------------------
 # Top-line metrics
 # ---------------------------------------------------------------------------
+avg_swing = filtered["Swing"].mean()
+max_swing_val = filtered["Swing"].max()
+max_swing_row = filtered.loc[filtered["Swing"].idxmax()]
+
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Countries", f"{filtered['Country'].nunique()}")
-col2.metric("Days observed", f"{filtered['Date'].nunique():,}")
-col3.metric("Avg daily swing", f"€{filtered['Swing'].mean():,.1f}")
-col4.metric("Largest single swing", f"€{filtered['Swing'].max():,.1f}")
+col1.metric(
+    "Countries selected",
+    f"{filtered['Country'].nunique()}",
+    help="Number of countries currently included in the view.",
+)
+col2.metric(
+    "Days analysed",
+    f"{filtered['Date'].nunique():,}",
+    help="Total trading days observed across the selected countries and date range.",
+)
+col3.metric(
+    "Average daily swing",
+    f"€{avg_swing:,.0f} /MWh",
+    help=(
+        "Average gap between the most expensive and cheapest hour of each day "
+        "(€ per megawatt-hour). Divide by 1000 to get € per kWh — the unit on "
+        "most household bills."
+    ),
+)
+col4.metric(
+    "Largest single day",
+    f"€{max_swing_val:,.0f} /MWh",
+    help=(
+        f"Biggest one-day swing in the selection: {max_swing_row['Country']} on "
+        f"{max_swing_row['Date'].strftime('%d %b %Y')}, when prices ranged from "
+        f"€{max_swing_row['Trough']:,.0f} to €{max_swing_row['Peak']:,.0f} /MWh."
+    ),
+)
 
 st.divider()
 
@@ -573,9 +618,12 @@ with tab_ts:
 
     with st.expander("ℹ️ How to read this"):
         st.markdown(
-            "Each line shows the rolling mean of the daily peak-to-trough spread "
-            "for one country. Higher values = bigger intraday price differences = "
-            "more value for flexibility (batteries, demand response, etc.)."
+            "Each line tracks one country's daily swing over time, smoothed with a "
+            "rolling average. A line trending **upward** means that country's "
+            "electricity prices are becoming more volatile within the day — often "
+            "driven by rising shares of solar (cheap midday hours) and high evening "
+            "demand. Spikes usually mark stress events: cold snaps, low-wind weeks, "
+            "or supply disruptions."
         )
 
 
@@ -622,8 +670,15 @@ with tab_heat:
                 x=pivot.columns,
                 y=weekday_labels,
                 colorscale=ACCENT_SCALE,
-                colorbar=dict(title="€/MWh", tickfont=dict(color=COLOR_TEXT)),
-                hovertemplate="Week %{x}<br>%{y}<br>Swing: €%{z:.1f}<extra></extra>",
+                colorbar=dict(
+                    title=dict(text="€/MWh", side="right", font=dict(color=COLOR_TEXT, size=12)),
+                    tickfont=dict(color=COLOR_TEXT, size=11),
+                    thickness=14,
+                    len=0.9,
+                    xpad=10,
+                    tickformat=",.0f",
+                ),
+                hovertemplate="Week %{x}<br>%{y}<br>Swing: €%{z:.0f} /MWh<extra></extra>",
             )
         )
         fig_heat.update_layout(
@@ -631,14 +686,30 @@ with tab_heat:
             yaxis=dict(title="", autorange="reversed"),
         )
         apply_dark_theme(fig_heat, height=320)
+        # Override the right margin so the colorbar isn't clipped
+        fig_heat.update_layout(margin=dict(l=10, r=80, t=10, b=10))
         st.plotly_chart(fig_heat, width="stretch")
 
+        sub_avg = sub["Swing"].mean()
+        sub_max_row = sub.loc[sub["Swing"].idxmax()]
         c1, c2, c3 = st.columns(3)
-        c1.metric("Country avg swing", f"€{sub['Swing'].mean():,.1f}")
-        c2.metric("Max swing day", f"€{sub['Swing'].max():,.1f}")
+        c1.metric(
+            f"{heat_country} avg swing",
+            f"€{sub_avg:,.0f} /MWh",
+            help="Mean daily peak-to-trough spread for this country in the selected window.",
+        )
+        c2.metric(
+            "Biggest one-day swing",
+            f"€{sub_max_row['Swing']:,.0f} /MWh",
+            help=(
+                f"Prices ranged from €{sub_max_row['Trough']:,.0f} (cheapest hour) "
+                f"to €{sub_max_row['Peak']:,.0f} (most expensive hour) on this date."
+            ),
+        )
         c3.metric(
-            "Date of max",
-            sub.loc[sub["Swing"].idxmax(), "Date"].strftime("%d %b %Y"),
+            "On",
+            sub_max_row["Date"].strftime("%d %b %Y"),
+            help="Date of the largest single-day swing for this country.",
         )
 
 
@@ -673,7 +744,7 @@ with tab_rank:
         x=label,
         y="Country",
         orientation="h",
-        text=ranking[label].round(1),
+        text=ranking[label].round(0),
         color=label,
         color_continuous_scale=ACCENT_SCALE,
     )
@@ -683,7 +754,12 @@ with tab_rank:
         yaxis_title="",
     )
     apply_dark_theme(fig_rank, height=max(350, 28 * len(ranking) + 60))
-    fig_rank.update_traces(texttemplate="€%{text}", textposition="outside", cliponaxis=False)
+    fig_rank.update_traces(
+        texttemplate="€%{text:,.0f}",
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate="%{y}<br>" + label + ": €%{x:,.0f} /MWh<extra></extra>",
+    )
     st.plotly_chart(fig_rank, width="stretch")
 
     # Distribution box plot — context for the headline ranking
