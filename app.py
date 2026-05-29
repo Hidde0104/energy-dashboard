@@ -502,7 +502,7 @@ with tab_ts:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     apply_dark_theme(fig_ts, height=500)
-    st.plotly_chart(fig_ts, use_container_width=True)
+    st.plotly_chart(fig_ts, width="stretch")
 
     with st.expander("ℹ️ How to read this"):
         st.markdown(
@@ -564,7 +564,7 @@ with tab_heat:
             yaxis=dict(title="", autorange="reversed"),
         )
         apply_dark_theme(fig_heat, height=320)
-        st.plotly_chart(fig_heat, use_container_width=True)
+        st.plotly_chart(fig_heat, width="stretch")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Country avg swing", f"€{sub['Swing'].mean():,.1f}")
@@ -617,7 +617,7 @@ with tab_rank:
     )
     apply_dark_theme(fig_rank, height=max(350, 28 * len(ranking) + 60))
     fig_rank.update_traces(texttemplate="€%{text}", textposition="outside", cliponaxis=False)
-    st.plotly_chart(fig_rank, use_container_width=True)
+    st.plotly_chart(fig_rank, width="stretch")
 
     # Distribution box plot — context for the headline ranking
     st.markdown("##### Distribution of daily swings")
@@ -635,7 +635,7 @@ with tab_rank:
     )
     apply_dark_theme(fig_box, height=420)
     fig_box.update_xaxes(tickangle=-30)
-    st.plotly_chart(fig_box, use_container_width=True)
+    st.plotly_chart(fig_box, width="stretch")
 
 
 # --- Data table -------------------------------------------------------------
@@ -649,7 +649,7 @@ with tab_data:
     for col in ["Trough", "Peak", "Swing", "Mean"]:
         display[col] = display[col].round(2)
 
-    st.dataframe(display, use_container_width=True, height=500, hide_index=True)
+    st.dataframe(display, width="stretch", height=500, hide_index=True)
 
     csv_buf = io.StringIO()
     display.to_csv(csv_buf, index=False)
