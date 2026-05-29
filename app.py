@@ -84,6 +84,20 @@ COLOR_ACCENT = "#00C490"
 COLOR_TEXT = "#E8ECF2"
 COLOR_MUTED = "#8B92A3"
 
+# Open Graph metadata — controls preview cards when the URL is shared on
+# LinkedIn, Slack, WhatsApp, X, etc. Streamlit doesn't expose <head> directly,
+# so we inject these tags via markdown. They get picked up by most crawlers.
+st.markdown(
+    """
+    <meta property="og:title" content="European Power Market Volatility | Impulse" />
+    <meta property="og:description" content="Intraday electricity price spreads across European day-ahead markets — a proxy for battery storage and trading revenue opportunity." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="description" content="Intraday power market volatility dashboard for European countries. Built by Impulse." />
+    """,
+    unsafe_allow_html=True,
+)
+
 # Custom CSS for a cleaner, more editorial look on dark theme
 st.markdown(
     f"""
@@ -225,34 +239,52 @@ EXPECTED_COLUMNS = {
 }
 
 
+# BESS battery durations we pre-compute spread capture for. Confirmed by user: 1, 2, 3, 4 hours.
+BESS_DURATIONS = [1, 2, 3, 4]
+
+
+def _nhour_spread(hourly_prices: list, n: int) -> float:
+    """Per-MWh spread captured by an N-hour battery on a day with these hourly prices.
+
+    Charge during the cheapest N hours, discharge during the most expensive N hours.
+    Returns mean(top N) - mean(bottom N) in €/MWh. If fewer than 2N hours are
+    available (incomplete day), returns NaN — caller should drop those days.
+    """
+    if len(hourly_prices) < 2 * n:
+        return float("nan")
+    sorted_prices = sorted(hourly_prices)
+    bottom_n_mean = sum(sorted_prices[:n]) / n
+    top_n_mean = sum(sorted_prices[-n:]) / n
+    return top_n_mean - bottom_n_mean
+
+
 @st.cache_data(show_spinner="Loading and aggregating price data…")
 def load_and_aggregate(source) -> tuple[pd.DataFrame, dict]:
-    """Stream the hourly CSV in chunks and aggregate to daily swings on the fly.
+    """Stream the hourly CSV in chunks and aggregate to daily metrics.
 
-    This avoids holding the full hourly dataset (often hundreds of MB) in memory.
-    For each chunk we accumulate per-(country, date) min, max, sum, and count,
-    then combine across chunks at the end.
+    For each (country, date) we accumulate the list of hourly prices, then at
+    the end compute:
+      - Peak, Trough, Mean, Swing (daily max, min, mean, max-min)
+      - N-hour spread capture for each duration in BESS_DURATIONS
 
-    Returns a tuple of (daily_swings_df, metadata_dict).
+    The hourly lists are bounded — at most 24 floats per (country, date),
+    so total memory stays well under the chunk size itself.
+
+    Returns (daily_df, metadata_dict).
     """
-    CHUNK_SIZE = 200_000  # rows per chunk — keeps peak memory low
+    CHUNK_SIZE = 200_000
 
-    # Per-key accumulators: keyed by (country, iso, date)
-    peak: dict = {}
-    trough: dict = {}
-    price_sum: dict = {}
-    hours: dict = {}
+    # Per-(country, iso, date) list of hourly prices. Bounded at 24 entries each.
+    prices_by_day: dict = {}
 
     total_rows = 0
     countries_seen: set = set()
     header_checked = False
 
-    # Note: BytesIO needs to be rewound between reads, but pd.read_csv with
-    # chunksize handles it via a single iterator.
     reader = pd.read_csv(
         source,
         chunksize=CHUNK_SIZE,
-        usecols=list(EXPECTED_COLUMNS),  # skip any extra columns Ember might add
+        usecols=list(EXPECTED_COLUMNS),
     )
 
     for chunk in reader:
@@ -264,7 +296,6 @@ def load_and_aggregate(source) -> tuple[pd.DataFrame, dict]:
                 )
             header_checked = True
 
-        # Parse + clean this chunk
         chunk["Datetime"] = pd.to_datetime(chunk["Datetime (Local)"], errors="coerce")
         chunk["Price"] = pd.to_numeric(chunk["Price (EUR/MWhe)"], errors="coerce")
         chunk = chunk.dropna(subset=["Datetime", "Price"])
@@ -275,61 +306,65 @@ def load_and_aggregate(source) -> tuple[pd.DataFrame, dict]:
         countries_seen.update(chunk["Country"].unique())
         total_rows += len(chunk)
 
-        # Aggregate within this chunk first — turns ~200k rows into ~ N_countries * N_days_in_chunk rows
-        agg = chunk.groupby(
-            ["Country", "ISO3 Code", "Date"], sort=False
-        )["Price"].agg(["max", "min", "sum", "count"])
-
-        # Merge chunk aggregates into running accumulators
-        for (country, iso, date), row in agg.iterrows():
+        # Iterate with itertuples for speed — much faster than iterrows
+        # and avoids the chunk-level groupby overhead.
+        for row in chunk[["Country", "ISO3 Code", "Date", "Price"]].itertuples(
+            index=False, name=None
+        ):
+            country, iso, date, price = row
             key = (country, iso, date)
-            row_max = row["max"]
-            row_min = row["min"]
-            row_sum = row["sum"]
-            row_count = row["count"]
-
-            if key in peak:
-                if row_max > peak[key]:
-                    peak[key] = row_max
-                if row_min < trough[key]:
-                    trough[key] = row_min
-                price_sum[key] += row_sum
-                hours[key] += row_count
+            lst = prices_by_day.get(key)
+            if lst is None:
+                prices_by_day[key] = [price]
             else:
-                peak[key] = row_max
-                trough[key] = row_min
-                price_sum[key] = row_sum
-                hours[key] = row_count
+                lst.append(price)
 
-        # Free the chunk explicitly so memory drops between iterations
-        del chunk, agg
+        del chunk
 
-    if not peak:
+    if not prices_by_day:
         raise ValueError("No usable rows found in the data.")
 
-    # Materialize accumulators into a DataFrame
-    keys = list(peak.keys())
-    swings = pd.DataFrame(
+    # Build the final DataFrame. For each day with enough coverage, compute
+    # daily aggregates + the N-hour spreads for each BESS duration.
+    keys, peaks, troughs, means, hours_list, swings_list = [], [], [], [], [], []
+    spread_cols: dict[int, list] = {n: [] for n in BESS_DURATIONS}
+
+    for key, prices in prices_by_day.items():
+        n_hours = len(prices)
+        if n_hours < 20:
+            continue  # drop days with poor coverage
+        keys.append(key)
+        peaks.append(max(prices))
+        troughs.append(min(prices))
+        means.append(sum(prices) / n_hours)
+        hours_list.append(n_hours)
+        swings_list.append(peaks[-1] - troughs[-1])
+        for n in BESS_DURATIONS:
+            spread_cols[n].append(_nhour_spread(prices, n))
+
+    if not keys:
+        raise ValueError("No days with sufficient hourly coverage (≥20 of 24 hours).")
+
+    daily = pd.DataFrame(
         {
             "Country": [k[0] for k in keys],
             "ISO3 Code": [k[1] for k in keys],
             "Date": pd.to_datetime([k[2] for k in keys]),
-            "Peak": [peak[k] for k in keys],
-            "Trough": [trough[k] for k in keys],
-            "Hours": [hours[k] for k in keys],
+            "Peak": peaks,
+            "Trough": troughs,
+            "Mean": means,
+            "Hours": hours_list,
+            "Swing": swings_list,
         }
     )
-    swings["Mean"] = [price_sum[k] / hours[k] for k in keys]
-    swings["Swing"] = swings["Peak"] - swings["Trough"]
-
-    # Only keep days with reasonable coverage (≥ 20 hours of 24)
-    swings = swings[swings["Hours"] >= 20].reset_index(drop=True)
+    for n in BESS_DURATIONS:
+        daily[f"Spread_{n}h"] = spread_cols[n]
 
     metadata = {
         "total_rows": total_rows,
         "countries": len(countries_seen),
     }
-    return swings, metadata
+    return daily, metadata
 
 
 @st.cache_data(show_spinner="Downloading data from Ember (one-time, ~60s)…", ttl=24 * 3600)
@@ -414,15 +449,12 @@ if LOGO_PATH.exists():
     with logo_col:
         st.image(str(LOGO_PATH), width=72)
     with title_col:
-        st.title("European Intraday Price Swings")
+        st.title("European Power Market Volatility")
 else:
-    st.title("European Intraday Price Swings")
+    st.title("European Power Market Volatility")
 st.caption(
-    "How much does the price of electricity move within a single day? "
-    "This dashboard shows the daily **peak-to-trough spread** — the gap between "
-    "the most expensive and cheapest hour — for European day-ahead power markets. "
-    "Wider swings mean more value for flexibility (batteries, demand shifting) "
-    "and bigger price differences for consumers across the day."
+    "Intraday price spreads across European day-ahead electricity markets — "
+    "a proxy for battery storage and trading revenue opportunity."
 )
 
 source = resolve_data_source()
@@ -542,6 +574,55 @@ avg_swing = filtered["Swing"].mean()
 max_swing_val = filtered["Swing"].max()
 max_swing_row = filtered.loc[filtered["Swing"].idxmax()]
 
+# Hero summary — dynamic, narrative, sets the framing for what follows
+country_list = sorted(filtered["Country"].unique().tolist())
+if len(country_list) == 1:
+    country_phrase = country_list[0]
+elif len(country_list) == 2:
+    country_phrase = f"{country_list[0]} and {country_list[1]}"
+elif len(country_list) <= 5:
+    country_phrase = ", ".join(country_list[:-1]) + f", and {country_list[-1]}"
+else:
+    country_phrase = f"{len(country_list)} selected markets"
+
+window_label = f"{start_ts.strftime('%b %Y')} to {end_ts.strftime('%b %Y')}"
+median_swing = filtered["Swing"].median()
+p95_swing = filtered["Swing"].quantile(0.95)
+
+# Headline 2-hour BESS revenue across the selected markets (gross)
+hero_spread_2h = filtered["Spread_2h"].dropna().mean() if "Spread_2h" in filtered.columns else None
+hero_annual_2h = hero_spread_2h * 2 * 365 if hero_spread_2h is not None else None
+
+bess_sentence = (
+    f"A 2-hour battery operating across these markets would have captured roughly "
+    f"<strong style='color: {COLOR_ACCENT};'>€{hero_annual_2h:,.0f}/MW/year</strong> "
+    f"in gross arbitrage revenue."
+    if hero_annual_2h is not None
+    else "See the BESS revenue tab for arbitrage opportunity estimates."
+)
+
+st.markdown(
+    f"""
+    <div style="
+        background: linear-gradient(135deg, rgba(0, 196, 144, 0.08) 0%, rgba(0, 196, 144, 0.02) 100%);
+        border-left: 3px solid {COLOR_ACCENT};
+        border-radius: 8px;
+        padding: 1rem 1.25rem;
+        margin: 0.5rem 0 1.25rem 0;
+        font-size: 1.02rem;
+        line-height: 1.55;
+        color: {COLOR_TEXT};
+    ">
+        Across <strong>{country_phrase}</strong> ({window_label}), day-ahead power prices
+        swung by a median of <strong style="color: {COLOR_ACCENT};">€{median_swing:,.0f} /MWh</strong>
+        between the daily peak and trough hour. The top 5% of days saw spreads above
+        <strong style="color: {COLOR_ACCENT};">€{p95_swing:,.0f} /MWh</strong>.
+        {bess_sentence}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 col1, col2, col3, col4 = st.columns(4)
 col1.metric(
     "Countries selected",
@@ -578,14 +659,14 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Tabs for the four views
 # ---------------------------------------------------------------------------
-tab_ts, tab_heat, tab_rank, tab_data = st.tabs(
-    ["📈 Time series", "🗓️ Calendar heatmap", "🏆 Country ranking", "📋 Data"]
+tab_ts, tab_heat, tab_rank, tab_bess, tab_data = st.tabs(
+    ["📈 Volatility trend", "🗓️ Calendar heatmap", "🏆 Market ranking", "💰 BESS revenue", "📋 Data"]
 )
 
 
 # --- Time series ------------------------------------------------------------
 with tab_ts:
-    st.subheader("Daily intraday swing over time")
+    st.subheader("How is volatility evolving across markets?")
 
     smoothing = st.slider(
         "Rolling average (days)",
@@ -601,6 +682,29 @@ with tab_ts:
         .transform(lambda s: s.rolling(smoothing, min_periods=1).mean())
     )
 
+    # Auto-generated insight — which country trended the most, up or down?
+    if len(country_list) >= 2 and len(ts) > 60:
+        # Compare first 30-day mean to last 30-day mean per country
+        recency = ts.copy()
+        latest_date = recency["Date"].max()
+        first_30_cutoff = recency["Date"].min() + pd.Timedelta(days=30)
+        last_30_cutoff = latest_date - pd.Timedelta(days=30)
+        first_period = recency[recency["Date"] <= first_30_cutoff].groupby("Country")["Swing"].mean()
+        last_period = recency[recency["Date"] >= last_30_cutoff].groupby("Country")["Swing"].mean()
+        common = first_period.index.intersection(last_period.index)
+        if len(common) >= 2:
+            change_pct = ((last_period[common] - first_period[common]) / first_period[common] * 100).dropna()
+            if not change_pct.empty:
+                top_riser = change_pct.idxmax()
+                top_change = change_pct[top_riser]
+                if abs(top_change) >= 5:
+                    direction = "increased" if top_change > 0 else "decreased"
+                    st.info(
+                        f"📊 **Key trend:** {top_riser}'s daily volatility has {direction} "
+                        f"by **{abs(top_change):.0f}%** comparing the start versus end of the "
+                        f"selected window — the largest shift among the selected markets."
+                    )
+
     fig_ts = px.line(
         ts,
         x="Date",
@@ -613,23 +717,51 @@ with tab_ts:
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
+
+    # Annotate major macro events if they fall inside the visible window
+    MACRO_EVENTS = [
+        (pd.Timestamp("2022-02-24"), "Russian invasion<br>of Ukraine"),
+        (pd.Timestamp("2022-08-26"), "TTF gas peak"),
+        (pd.Timestamp("2022-12-12"), "Winter cold snap"),
+        (pd.Timestamp("2023-07-01"), "Summer solar<br>oversupply"),
+    ]
+    ymax_for_ann = ts["Smoothed"].max() * 1.05 if not ts.empty else 100
+    for event_date, label in MACRO_EVENTS:
+        if start_ts <= event_date <= end_ts:
+            fig_ts.add_vline(
+                x=event_date,
+                line=dict(color="rgba(255,255,255,0.25)", width=1, dash="dot"),
+            )
+            fig_ts.add_annotation(
+                x=event_date,
+                y=ymax_for_ann,
+                yref="y",
+                text=label,
+                showarrow=False,
+                font=dict(color="rgba(255,255,255,0.55)", size=10),
+                align="center",
+                bgcolor="rgba(31, 39, 57, 0.7)",
+                borderpad=4,
+            )
+
     apply_dark_theme(fig_ts, height=500)
     st.plotly_chart(fig_ts, width="stretch")
 
     with st.expander("ℹ️ How to read this"):
         st.markdown(
-            "Each line tracks one country's daily swing over time, smoothed with a "
-            "rolling average. A line trending **upward** means that country's "
-            "electricity prices are becoming more volatile within the day — often "
-            "driven by rising shares of solar (cheap midday hours) and high evening "
-            "demand. Spikes usually mark stress events: cold snaps, low-wind weeks, "
-            "or supply disruptions."
+            "Each line tracks one country's daily peak-to-trough spread over time, "
+            "smoothed by a rolling average. **Upward trends** typically reflect rising "
+            "renewable penetration (cheap midday solar, expensive evening peak) or "
+            "tightening capacity margins. **Spikes** mark stress events — cold snaps, "
+            "low-wind periods, fuel supply shocks. For a trading or BESS operator, the "
+            "trajectory matters as much as the level: a market where spreads are "
+            "*growing* offers compounding revenue upside over an asset's lifetime."
         )
 
 
 # --- Calendar heatmap -------------------------------------------------------
 with tab_heat:
-    st.subheader("Calendar heatmap of daily swings")
+    st.subheader("When does volatility happen?")
 
     heat_country = st.selectbox(
         "Country",
@@ -717,7 +849,11 @@ with tab_heat:
 
 # --- Country ranking --------------------------------------------------------
 with tab_rank:
-    st.subheader("Country ranking by intraday swing")
+    st.subheader("Where is the opportunity biggest?")
+    st.caption(
+        "Ranking markets by the size of their intraday spreads. For battery storage and "
+        "intraday trading, bigger and more consistent spreads mean more revenue per MW."
+    )
 
     metric_choice = st.radio(
         "Rank by",
@@ -783,15 +919,181 @@ with tab_rank:
     st.plotly_chart(fig_box, width="stretch")
 
 
+# --- BESS revenue calculator ------------------------------------------------
+with tab_bess:
+    st.subheader("How much could a battery have earned?")
+    st.caption(
+        "Modelled as gross arbitrage revenue: charge during the cheapest N hours of "
+        "each day, discharge during the most expensive N. Numbers are **gross** — no "
+        "round-trip efficiency losses, degradation, fees, or imbalance costs deducted. "
+        "Useful as a market-attractiveness ranking, not as an investment forecast."
+    )
+
+    # Duration selector
+    duration = st.radio(
+        "Battery duration",
+        options=BESS_DURATIONS,
+        index=1,  # default to 2h — the most common utility-scale spec
+        horizontal=True,
+        format_func=lambda h: f"{h}-hour",
+        help=(
+            "Hours of energy storage at rated power. A 2-hour, 10 MW battery can "
+            "discharge 10 MW for 2 hours (20 MWh delivered per full cycle)."
+        ),
+    )
+    spread_col = f"Spread_{duration}h"
+
+    # Verify we have the column (sanity guard against future schema drift)
+    if spread_col not in filtered.columns:
+        st.error(
+            f"BESS spread column `{spread_col}` not found in the data. "
+            "This usually means BESS_DURATIONS changed in load_and_aggregate."
+        )
+        st.stop()
+
+    # Per-day daily revenue per MW (gross): spread × duration MWh × 1 cycle/day
+    # Then aggregate to annual €/MW/year by averaging daily revenue × 365
+    bess_data = filtered[["Country", "ISO3 Code", "Date", spread_col]].copy()
+    bess_data = bess_data.dropna(subset=[spread_col])
+    bess_data["Daily_Revenue_per_MW"] = bess_data[spread_col] * duration  # €/MW/day
+
+    # Annualised by country — mean daily × 365 to extrapolate to a full year
+    annual_per_country = (
+        bess_data.groupby("Country")["Daily_Revenue_per_MW"]
+        .mean()
+        .mul(365)
+        .reset_index()
+        .rename(columns={"Daily_Revenue_per_MW": "Annual_per_MW"})
+        .sort_values("Annual_per_MW", ascending=False)
+    )
+
+    # Headline metrics
+    overall_avg_spread = bess_data[spread_col].mean()
+    overall_annual = overall_avg_spread * duration * 365
+    best_country = annual_per_country.iloc[0]
+    worst_country = annual_per_country.iloc[-1]
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric(
+        f"Avg gross revenue ({duration}h BESS)",
+        f"€{overall_annual:,.0f} /MW/year",
+        help=(
+            f"Across all selected markets, a {duration}-hour battery would have captured "
+            f"€{overall_avg_spread:,.1f}/MWh per cycle on average. Multiplied by "
+            f"{duration} MWh per cycle and 365 cycles/year."
+        ),
+    )
+    m2.metric(
+        "Best market",
+        f"{best_country['Country']}",
+        delta=f"€{best_country['Annual_per_MW']:,.0f} /MW/yr",
+        delta_color="off",
+        help="Country with the highest gross revenue per MW in the selected window.",
+    )
+    m3.metric(
+        "Worst market",
+        f"{worst_country['Country']}",
+        delta=f"€{worst_country['Annual_per_MW']:,.0f} /MW/yr",
+        delta_color="off",
+        help="Country with the lowest gross revenue per MW in the selected window.",
+    )
+
+    # Ranking bar chart: annual €/MW/year by country
+    st.markdown("##### Annual gross revenue by market")
+    ranking_for_plot = annual_per_country.sort_values("Annual_per_MW", ascending=True)
+    fig_bess = px.bar(
+        ranking_for_plot,
+        x="Annual_per_MW",
+        y="Country",
+        orientation="h",
+        text=ranking_for_plot["Annual_per_MW"].round(0),
+        color="Annual_per_MW",
+        color_continuous_scale=ACCENT_SCALE,
+    )
+    fig_bess.update_traces(
+        texttemplate="€%{text:,.0f}",
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate=(
+            "%{y}<br>Gross revenue: €%{x:,.0f} /MW/year"
+            f"<br>({duration}-hour battery, 365 cycles, no losses)<extra></extra>"
+        ),
+    )
+    fig_bess.update_layout(
+        coloraxis_showscale=False,
+        xaxis_title=f"€/MW/year (gross, {duration}-hour battery, 365 cycles)",
+        yaxis_title="",
+    )
+    apply_dark_theme(fig_bess, height=max(350, 28 * len(ranking_for_plot) + 60))
+    st.plotly_chart(fig_bess, width="stretch")
+
+    # Monthly revenue trend — useful for seeing when in the year revenue is concentrated
+    st.markdown("##### Monthly revenue trend")
+    monthly = bess_data.copy()
+    monthly["Month"] = monthly["Date"].dt.to_period("M").dt.to_timestamp()
+    monthly_revenue = (
+        monthly.groupby(["Country", "Month"])["Daily_Revenue_per_MW"]
+        .sum()  # sum of daily revenues across the month = actual monthly capture
+        .reset_index()
+        .rename(columns={"Daily_Revenue_per_MW": "Monthly_Revenue_per_MW"})
+    )
+
+    fig_monthly = px.line(
+        monthly_revenue,
+        x="Month",
+        y="Monthly_Revenue_per_MW",
+        color="Country",
+        labels={"Monthly_Revenue_per_MW": "€/MW/month", "Month": ""},
+        color_discrete_sequence=ACCENT_SEQUENCE,
+        markers=True,
+    )
+    fig_monthly.update_traces(
+        hovertemplate="%{x|%b %Y}<br>%{y:,.0f} €/MW<extra></extra>",
+    )
+    fig_monthly.update_layout(
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    apply_dark_theme(fig_monthly, height=420)
+    st.plotly_chart(fig_monthly, width="stretch")
+
+    with st.expander("📐 Methodology and limits"):
+        st.markdown(
+            f"""
+            **What this calculates:** For each day and country, we take the actual 24 hourly
+            day-ahead prices, sort them, and assume a perfect-foresight battery charges during
+            the cheapest **{duration}** hours and discharges during the most expensive **{duration}** hours.
+            The spread captured per MWh discharged is multiplied by **{duration} MWh per cycle** and
+            **365 cycles per year** to produce annual gross revenue per MW of installed power.
+
+            **What's deliberately excluded:**
+            - **Round-trip efficiency losses** (real lithium-ion BESS: ~85–90%)
+            - **Degradation and capex** — this is a top-line revenue figure, not a return
+            - **Imbalance, grid fees, taxes, balancing market participation**
+            - **Auction clearing & price-taker dynamics** — assumes you can transact at the
+              clearing price without moving it
+            - **Forecasting error** — assumes perfect foresight of when the daily peak/trough will be
+
+            **Why this is still a useful market-selection signal:** All the excluded factors apply
+            *similarly* across markets. A market with 2× the gross arbitrage opportunity will,
+            after losses, still have roughly 2× the net opportunity. The ranking is more
+            defensible than the absolute number — point this at your client as a relative
+            attractiveness map, not as a P&L forecast.
+            """
+        )
+
+
 # --- Data table -------------------------------------------------------------
 with tab_data:
-    st.subheader("Underlying daily aggregates")
+    st.subheader("Daily aggregates · downloadable")
     st.caption("Filtered to your sidebar selection. Click columns to sort.")
 
-    display = filtered[["Country", "ISO3 Code", "Date", "Trough", "Peak", "Swing", "Mean"]].copy()
+    base_cols = ["Country", "ISO3 Code", "Date", "Trough", "Peak", "Swing", "Mean"]
+    bess_cols = [f"Spread_{n}h" for n in BESS_DURATIONS if f"Spread_{n}h" in filtered.columns]
+    display = filtered[base_cols + bess_cols].copy()
     display = display.sort_values(["Date", "Country"], ascending=[False, True])
     display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
-    for col in ["Trough", "Peak", "Swing", "Mean"]:
+    for col in ["Trough", "Peak", "Swing", "Mean"] + bess_cols:
         display[col] = display[col].round(2)
 
     st.dataframe(display, width="stretch", height=500, hide_index=True)
@@ -801,7 +1103,7 @@ with tab_data:
     st.download_button(
         "⬇️ Download as CSV",
         data=csv_buf.getvalue(),
-        file_name="intraday_swings_filtered.csv",
+        file_name="impulse_european_power_volatility.csv",
         mime="text/csv",
     )
 
@@ -810,6 +1112,27 @@ with tab_data:
 # Footer
 # ---------------------------------------------------------------------------
 st.divider()
+
+# Impulse branding block
+st.markdown(
+    f"""
+    <div style="
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 1rem;
+        padding: 0.75rem 0 0.25rem 0;
+        margin-bottom: 0.5rem;
+    ">
+        <div style="color: {COLOR_TEXT}; font-size: 0.95rem;">
+            Built by <strong style="color: {COLOR_ACCENT};">Impulse</strong> —
+            <span style="color: {COLOR_MUTED};">market intelligence for the energy transition</span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 footer_col1, footer_col2 = st.columns([3, 2])
 with footer_col1:
