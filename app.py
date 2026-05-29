@@ -671,7 +671,7 @@ with tab_heat:
                 y=weekday_labels,
                 colorscale=ACCENT_SCALE,
                 colorbar=dict(
-                    title=dict(text="€/MWh", side="right", font=dict(color=COLOR_TEXT, size=12)),
+                    title=dict(text="€/MWh", side="top", font=dict(color=COLOR_TEXT, size=12)),
                     tickfont=dict(color=COLOR_TEXT, size=11),
                     thickness=14,
                     len=0.9,
