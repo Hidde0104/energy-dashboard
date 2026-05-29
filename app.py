@@ -1,0 +1,682 @@
+"""
+European Intraday Energy Price Swing Dashboard
+==============================================
+Interactive Streamlit app analysing intraday (peak-to-trough) price swings
+across European countries over the past 12 months.
+
+Run:
+    pip install -r requirements.txt
+    streamlit run app.py
+
+The app looks for `all_countries.csv` in the same folder as this script.
+If not found, it offers a file uploader fallback.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import zipfile
+from datetime import timedelta
+from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen, Request
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# File paths (defined before page config because set_page_config needs LOGO_PATH)
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+GUIDA_PATH = SCRIPT_DIR / "fonts" / "guida-bold.otf"
+LOGO_PATH = SCRIPT_DIR / "logo.png"
+
+# ---------------------------------------------------------------------------
+# Page configuration
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="European Intraday Price Swings",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else "⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# Typography — load Guida Bold from local file, Inter from Google Fonts
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data
+def _font_face_rule() -> str:
+    """Build a @font-face CSS rule with the Guida Bold file embedded as base64.
+
+    Returns an empty string (and warns) if the file is missing, so the rest of
+    the app still works — the title just falls back to the next font.
+    """
+    if not GUIDA_PATH.exists():
+        return ""
+    encoded = base64.b64encode(GUIDA_PATH.read_bytes()).decode("ascii")
+    return f"""
+    @font-face {{
+        font-family: 'Guida';
+        font-style: normal;
+        font-weight: 700;
+        font-display: swap;
+        src: url(data:font/otf;base64,{encoded}) format('opentype');
+    }}
+    """
+
+
+_guida_rule = _font_face_rule()
+if not _guida_rule:
+    st.sidebar.warning(
+        "⚠️ `fonts/guida-bold.otf` not found — the title will use a fallback font."
+    )
+
+# Theme colors (kept in sync with .streamlit/config.toml)
+COLOR_BG = "#1F2739"
+COLOR_SURFACE = "#363D4D"
+COLOR_ACCENT = "#00C490"
+COLOR_TEXT = "#E8ECF2"
+COLOR_MUTED = "#8B92A3"
+
+# Custom CSS for a cleaner, more editorial look on dark theme
+st.markdown(
+    f"""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+        {_guida_rule}
+
+        /* Base body text — Inter Light everywhere by default */
+        html, body, [class*="css"], .stMarkdown, .stMarkdown p, .stMarkdown li,
+        .stCaption, label, .stRadio, .stSelectbox, .stMultiSelect, .stSlider,
+        div[data-testid="stSidebar"] *, .stTabs, .stDataFrame,
+        .stExpander, .stAlert {{
+            font-family: 'Inter', sans-serif !important;
+            font-weight: 300;
+        }}
+
+        /* Section sub-headers stay Inter but a touch heavier for hierarchy */
+        h2, h3, h4, h5, h6 {{
+            font-family: 'Inter', sans-serif !important;
+            font-weight: 500;
+            letter-spacing: -0.01em;
+        }}
+
+        /* Main title — Guida Bold in accent teal */
+        h1 {{
+            font-family: 'Guida', Georgia, serif !important;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: {COLOR_ACCENT} !important;
+        }}
+
+        .main .block-container {{ padding-top: 2rem; padding-bottom: 3rem; max-width: 1400px; }}
+
+        /* Metric numbers — Inter Medium (500), accent green.
+           Streamlit's internal CSS forces bold; we override with maximum
+           specificity by targeting the test-id AND every nested element type. */
+        div[data-testid="stMetricValue"],
+        div[data-testid="stMetricValue"] div,
+        div[data-testid="stMetricValue"] p,
+        div[data-testid="stMetricValue"] span,
+        div[data-testid="stMetricValue"] > * {{
+            font-family: 'Inter', sans-serif !important;
+            font-weight: 500 !important;
+            color: {COLOR_ACCENT} !important;
+            font-synthesis-weight: none !important;
+            -webkit-font-smoothing: antialiased;
+        }}
+        div[data-testid="stMetricValue"] {{
+            font-size: 1.6rem !important;
+        }}
+        div[data-testid="stMetricLabel"],
+        div[data-testid="stMetricLabel"] div,
+        div[data-testid="stMetricLabel"] p,
+        div[data-testid="stMetricLabel"] span,
+        div[data-testid="stMetricLabel"] > * {{
+            font-family: 'Inter', sans-serif !important;
+            font-weight: 300 !important;
+        }}
+        [data-testid="stMetric"] {{
+            background: {COLOR_SURFACE};
+            padding: 1rem 1.25rem;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.04);
+        }}
+
+        .stPlotlyChart {{
+            background: {COLOR_SURFACE};
+            border-radius: 10px;
+            padding: 0.75rem;
+            border: 1px solid rgba(255,255,255,0.04);
+        }}
+        div[data-testid="stSidebarUserContent"] {{ padding-top: 1rem; }}
+        .stTabs [data-baseweb="tab-list"] {{ gap: 4px; }}
+        .stTabs [data-baseweb="tab"] {{
+            background: {COLOR_SURFACE};
+            border-radius: 8px 8px 0 0;
+            padding: 0.5rem 1rem;
+            font-weight: 400;
+        }}
+        .stTabs [aria-selected="true"] {{
+            background: {COLOR_ACCENT} !important;
+            color: {COLOR_BG} !important;
+            font-weight: 500;
+        }}
+        div[data-testid="stDataFrame"] {{
+            background: {COLOR_SURFACE};
+            border-radius: 10px;
+            padding: 0.5rem;
+        }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# Shared Plotly layout — applied to every chart so theming stays consistent
+def apply_dark_theme(fig, height=None):
+    fig.update_layout(
+        paper_bgcolor=COLOR_SURFACE,
+        plot_bgcolor=COLOR_SURFACE,
+        font=dict(color=COLOR_TEXT, family="Inter, sans-serif", size=12),
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.1)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.1)"),
+        legend=dict(bgcolor="rgba(0,0,0,0)"),
+    )
+    if height is not None:
+        fig.update_layout(height=height)
+    return fig
+
+
+# Color sequence built around the accent — used for multi-country line charts
+ACCENT_SEQUENCE = [
+    "#00C490", "#7DD3C0", "#F5C76A", "#E68C7C", "#A78BFA",
+    "#60A5FA", "#FB923C", "#F472B6", "#34D399", "#FBBF24",
+    "#94A3B8", "#22D3EE",
+]
+
+# Monochrome scale built from the accent — used for heatmap & bar gradients
+ACCENT_SCALE = [
+    [0.0, "#1F2739"],
+    [0.25, "#1E4A45"],
+    [0.5, "#1A6E5A"],
+    [0.75, "#069672"],
+    [1.0, "#00C490"],
+]
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+EXPECTED_COLUMNS = {
+    "Country",
+    "ISO3 Code",
+    "Datetime (UTC)",
+    "Datetime (Local)",
+    "Price (EUR/MWhe)",
+}
+
+
+@st.cache_data(show_spinner="Loading price data…")
+def load_data(source) -> pd.DataFrame:
+    """Load the energy price CSV from a path, uploaded file, or BytesIO."""
+    df = pd.read_csv(source)
+
+    missing = EXPECTED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Missing expected columns: {missing}. Found: {list(df.columns)}"
+        )
+
+    # Use local datetime — intraday swings are a local-time phenomenon
+    df["Datetime"] = pd.to_datetime(df["Datetime (Local)"], errors="coerce")
+    df = df.dropna(subset=["Datetime", "Price (EUR/MWhe)"])
+    df["Date"] = df["Datetime"].dt.date
+    df = df.rename(columns={"Price (EUR/MWhe)": "Price"})
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df = df.dropna(subset=["Price"])
+
+    return df[["Country", "ISO3 Code", "Datetime", "Date", "Price"]]
+
+
+@st.cache_data(show_spinner="Downloading data from Ember (one-time, ~60s)…", ttl=24 * 3600)
+def download_and_extract_zip(url: str) -> bytes:
+    """Download a zip file from a URL and return the bytes of the first CSV inside.
+
+    Cached for 24 hours, so the download only happens once per server lifetime
+    (or sooner if the cache is invalidated).
+    """
+    req = Request(url, headers={"User-Agent": "energy-dashboard/1.0"})
+    with urlopen(req, timeout=120) as resp:
+        zip_bytes = resp.read()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        # Find the first CSV file inside the archive
+        csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_members:
+            raise ValueError(
+                f"No CSV file found inside the zip. Contents: {zf.namelist()}"
+            )
+        with zf.open(csv_members[0]) as f:
+            return f.read()
+
+
+@st.cache_data(show_spinner="Computing daily swings…")
+def compute_daily_swings(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate hourly prices into daily peak, trough, and swing per country."""
+    grouped = (
+        df.groupby(["Country", "ISO3 Code", "Date"])["Price"]
+        .agg(["max", "min", "mean", "count"])
+        .reset_index()
+        .rename(columns={"max": "Peak", "min": "Trough", "mean": "Mean", "count": "Hours"})
+    )
+    grouped["Swing"] = grouped["Peak"] - grouped["Trough"]
+    grouped["Date"] = pd.to_datetime(grouped["Date"])
+    # Only keep days with reasonable coverage (≥ 20 hours of 24)
+    grouped = grouped[grouped["Hours"] >= 20]
+    return grouped
+
+
+# ---------------------------------------------------------------------------
+# Data source resolution
+# ---------------------------------------------------------------------------
+DEFAULT_CSV = SCRIPT_DIR / "all_countries.csv"
+EMBER_ZIP_URL = (
+    "https://files.ember-energy.org/public-downloads/price/outputs/"
+    "european_wholesale_electricity_price_data_hourly.zip"
+)
+
+
+def resolve_data_source():
+    """Resolve the data source in priority order:
+    1. Local `all_countries.csv` next to the script (fastest, used in dev)
+    2. Ember's public zip download (used in production / on Streamlit Cloud)
+    3. Manual file uploader (final fallback)
+    """
+    # Priority 1: local CSV — fastest, no network round trip
+    if DEFAULT_CSV.exists():
+        st.sidebar.success(f"📂 Loaded `{DEFAULT_CSV.name}` from script folder")
+        return DEFAULT_CSV
+
+    # Priority 2: Ember's public zip
+    try:
+        csv_bytes = download_and_extract_zip(EMBER_ZIP_URL)
+        st.sidebar.success("📥 Loaded latest data from Ember")
+        return io.BytesIO(csv_bytes)
+    except (URLError, zipfile.BadZipFile, ValueError, TimeoutError) as e:
+        st.sidebar.warning(
+            f"Could not fetch from Ember ({type(e).__name__}). "
+            "Upload the CSV manually below."
+        )
+
+    # Priority 3: uploader fallback
+    uploaded = st.sidebar.file_uploader(
+        "Upload your CSV",
+        type=["csv", "zip"],
+        help=(
+            "Expected columns: Country, ISO3 Code, Datetime (UTC), "
+            "Datetime (Local), Price (EUR/MWhe). A zip containing the CSV is also accepted."
+        ),
+    )
+    if uploaded is not None and uploaded.name.lower().endswith(".zip"):
+        # Unzip the uploaded archive
+        with zipfile.ZipFile(uploaded) as zf:
+            csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+            if not csv_members:
+                st.sidebar.error("No CSV found in the uploaded zip.")
+                return None
+            return io.BytesIO(zf.read(csv_members[0]))
+    return uploaded
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+if LOGO_PATH.exists():
+    logo_col, title_col = st.columns([1, 9], vertical_alignment="center")
+    with logo_col:
+        st.image(str(LOGO_PATH), width=72)
+    with title_col:
+        st.title("European Intraday Price Swings")
+else:
+    st.title("European Intraday Price Swings")
+st.caption(
+    "Daily peak-to-trough spreads in day-ahead electricity markets · EUR/MWh · local time"
+)
+
+source = resolve_data_source()
+if source is None:
+    st.info(
+        "👈 No data source available. The app tried to download from Ember "
+        "automatically — if that failed, please upload the CSV (or zip) in "
+        "the sidebar."
+    )
+    st.stop()
+
+try:
+    df_raw = load_data(source)
+except Exception as e:
+    st.error(f"Could not read the CSV: {e}")
+    st.stop()
+
+swings = compute_daily_swings(df_raw)
+
+if swings.empty:
+    st.error("No usable rows after cleaning. Check the input file.")
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Sidebar controls — past 12 months window
+# ---------------------------------------------------------------------------
+data_max_date = swings["Date"].max()
+default_start = data_max_date - pd.DateOffset(months=12) + pd.Timedelta(days=1)
+data_min_date = swings["Date"].min()
+
+st.sidebar.header("Filters")
+
+# Data source attribution — Ember requires credit + link under CC BY 4.0
+with st.sidebar.expander("ℹ️ About the data", expanded=False):
+    st.markdown(
+        """
+        **Source:** [Ember](https://ember-energy.org/) — European
+        Wholesale Electricity Price Data.
+
+        Ember is an independent energy think tank. Their data is published
+        under a [Creative Commons Attribution 4.0 (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/)
+        licence, which allows reuse with attribution.
+
+        **Suggested citation:**
+        Ember (2025). *European Wholesale Electricity Price Data.*
+        Accessed from ember-energy.org.
+        """
+    )
+
+date_range = st.sidebar.date_input(
+    "Date range",
+    value=(max(default_start.date(), data_min_date.date()), data_max_date.date()),
+    min_value=data_min_date.date(),
+    max_value=data_max_date.date(),
+    help="Defaults to the most recent 12 months in the dataset.",
+)
+
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    # User is mid-selection
+    st.sidebar.info("Pick a start and end date to continue.")
+    st.stop()
+
+start_ts = pd.Timestamp(start_date)
+end_ts = pd.Timestamp(end_date)
+
+countries_all = sorted(swings["Country"].unique())
+
+# Default: top 10 by mean swing in window for a sensible starting view
+window_mask = (swings["Date"] >= start_ts) & (swings["Date"] <= end_ts)
+default_top = (
+    swings[window_mask]
+    .groupby("Country")["Swing"]
+    .mean()
+    .sort_values(ascending=False)
+    .head(10)
+    .index.tolist()
+)
+
+selected_countries = st.sidebar.multiselect(
+    "Countries",
+    options=countries_all,
+    default=default_top if default_top else countries_all[:10],
+    help="Select one or more countries to compare.",
+)
+
+if not selected_countries:
+    st.warning("Select at least one country in the sidebar.")
+    st.stop()
+
+filtered = swings[
+    (swings["Country"].isin(selected_countries)) & window_mask
+].copy()
+
+if filtered.empty:
+    st.warning("No data in the selected range. Widen the filters.")
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Top-line metrics
+# ---------------------------------------------------------------------------
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Countries", f"{filtered['Country'].nunique()}")
+col2.metric("Days observed", f"{filtered['Date'].nunique():,}")
+col3.metric("Avg daily swing", f"€{filtered['Swing'].mean():,.1f}")
+col4.metric("Largest single swing", f"€{filtered['Swing'].max():,.1f}")
+
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Tabs for the four views
+# ---------------------------------------------------------------------------
+tab_ts, tab_heat, tab_rank, tab_data = st.tabs(
+    ["📈 Time series", "🗓️ Calendar heatmap", "🏆 Country ranking", "📋 Data"]
+)
+
+
+# --- Time series ------------------------------------------------------------
+with tab_ts:
+    st.subheader("Daily intraday swing over time")
+
+    smoothing = st.slider(
+        "Rolling average (days)",
+        min_value=1,
+        max_value=30,
+        value=7,
+        help="Smooth the line to see the trend through daily noise.",
+    )
+
+    ts = filtered.sort_values("Date").copy()
+    ts["Smoothed"] = (
+        ts.groupby("Country")["Swing"]
+        .transform(lambda s: s.rolling(smoothing, min_periods=1).mean())
+    )
+
+    fig_ts = px.line(
+        ts,
+        x="Date",
+        y="Smoothed",
+        color="Country",
+        labels={"Smoothed": f"Swing (€/MWh, {smoothing}-day avg)", "Date": ""},
+        color_discrete_sequence=ACCENT_SEQUENCE,
+    )
+    fig_ts.update_layout(
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    apply_dark_theme(fig_ts, height=500)
+    st.plotly_chart(fig_ts, use_container_width=True)
+
+    with st.expander("ℹ️ How to read this"):
+        st.markdown(
+            "Each line shows the rolling mean of the daily peak-to-trough spread "
+            "for one country. Higher values = bigger intraday price differences = "
+            "more value for flexibility (batteries, demand response, etc.)."
+        )
+
+
+# --- Calendar heatmap -------------------------------------------------------
+with tab_heat:
+    st.subheader("Calendar heatmap of daily swings")
+
+    heat_country = st.selectbox(
+        "Country",
+        options=selected_countries,
+        index=0,
+    )
+
+    sub = filtered[filtered["Country"] == heat_country].copy()
+    if sub.empty:
+        st.info("No data for this country in the selected window.")
+    else:
+        sub["Year"] = sub["Date"].dt.year
+        sub["Week"] = sub["Date"].dt.isocalendar().week.astype(int)
+        sub["DayOfWeek"] = sub["Date"].dt.dayofweek  # 0 = Monday
+        sub["YearWeek"] = (
+            sub["Date"].dt.strftime("%G-W%V")  # ISO year + ISO week
+        )
+
+        # Order by actual chronology, not lexicographically
+        order = (
+            sub.sort_values("Date")
+            .drop_duplicates("YearWeek")["YearWeek"]
+            .tolist()
+        )
+
+        pivot = sub.pivot_table(
+            index="DayOfWeek",
+            columns="YearWeek",
+            values="Swing",
+            aggfunc="mean",
+        ).reindex(index=range(7), columns=order)
+
+        weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        fig_heat = go.Figure(
+            data=go.Heatmap(
+                z=pivot.values,
+                x=pivot.columns,
+                y=weekday_labels,
+                colorscale=ACCENT_SCALE,
+                colorbar=dict(title="€/MWh", tickfont=dict(color=COLOR_TEXT)),
+                hovertemplate="Week %{x}<br>%{y}<br>Swing: €%{z:.1f}<extra></extra>",
+            )
+        )
+        fig_heat.update_layout(
+            xaxis=dict(title="", tickangle=-45, nticks=20),
+            yaxis=dict(title="", autorange="reversed"),
+        )
+        apply_dark_theme(fig_heat, height=320)
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Country avg swing", f"€{sub['Swing'].mean():,.1f}")
+        c2.metric("Max swing day", f"€{sub['Swing'].max():,.1f}")
+        c3.metric(
+            "Date of max",
+            sub.loc[sub["Swing"].idxmax(), "Date"].strftime("%d %b %Y"),
+        )
+
+
+# --- Country ranking --------------------------------------------------------
+with tab_rank:
+    st.subheader("Country ranking by intraday swing")
+
+    metric_choice = st.radio(
+        "Rank by",
+        options=["Mean daily swing", "Median daily swing", "Max daily swing", "95th percentile"],
+        horizontal=True,
+    )
+
+    agg_map = {
+        "Mean daily swing": ("mean", "Mean swing"),
+        "Median daily swing": ("median", "Median swing"),
+        "Max daily swing": ("max", "Max swing"),
+        "95th percentile": (lambda s: s.quantile(0.95), "P95 swing"),
+    }
+    agg_func, label = agg_map[metric_choice]
+
+    ranking = (
+        filtered.groupby("Country")["Swing"]
+        .agg(agg_func)
+        .reset_index()
+        .rename(columns={"Swing": label})
+        .sort_values(label, ascending=True)
+    )
+
+    fig_rank = px.bar(
+        ranking,
+        x=label,
+        y="Country",
+        orientation="h",
+        text=ranking[label].round(1),
+        color=label,
+        color_continuous_scale=ACCENT_SCALE,
+    )
+    fig_rank.update_layout(
+        coloraxis_showscale=False,
+        xaxis_title=f"{label} (€/MWh)",
+        yaxis_title="",
+    )
+    apply_dark_theme(fig_rank, height=max(350, 28 * len(ranking) + 60))
+    fig_rank.update_traces(texttemplate="€%{text}", textposition="outside", cliponaxis=False)
+    st.plotly_chart(fig_rank, use_container_width=True)
+
+    # Distribution box plot — context for the headline ranking
+    st.markdown("##### Distribution of daily swings")
+    fig_box = px.box(
+        filtered,
+        x="Country",
+        y="Swing",
+        points=False,
+        category_orders={"Country": ranking["Country"].tolist()[::-1]},
+        color_discrete_sequence=[COLOR_ACCENT],
+    )
+    fig_box.update_layout(
+        yaxis_title="Daily swing (€/MWh)",
+        xaxis_title="",
+    )
+    apply_dark_theme(fig_box, height=420)
+    fig_box.update_xaxes(tickangle=-30)
+    st.plotly_chart(fig_box, use_container_width=True)
+
+
+# --- Data table -------------------------------------------------------------
+with tab_data:
+    st.subheader("Underlying daily aggregates")
+    st.caption("Filtered to your sidebar selection. Click columns to sort.")
+
+    display = filtered[["Country", "ISO3 Code", "Date", "Trough", "Peak", "Swing", "Mean"]].copy()
+    display = display.sort_values(["Date", "Country"], ascending=[False, True])
+    display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
+    for col in ["Trough", "Peak", "Swing", "Mean"]:
+        display[col] = display[col].round(2)
+
+    st.dataframe(display, use_container_width=True, height=500, hide_index=True)
+
+    csv_buf = io.StringIO()
+    display.to_csv(csv_buf, index=False)
+    st.download_button(
+        "⬇️ Download as CSV",
+        data=csv_buf.getvalue(),
+        file_name="intraday_swings_filtered.csv",
+        mime="text/csv",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Footer
+# ---------------------------------------------------------------------------
+st.divider()
+
+footer_col1, footer_col2 = st.columns([3, 2])
+with footer_col1:
+    st.caption(
+        f"Dataset spans {data_min_date.strftime('%d %b %Y')} → "
+        f"{data_max_date.strftime('%d %b %Y')} · "
+        f"{df_raw['Country'].nunique()} countries · "
+        f"{len(df_raw):,} hourly observations"
+    )
+with footer_col2:
+    st.caption(
+        "Data: [Ember](https://ember-energy.org/) — "
+        "European Wholesale Electricity Price Data · "
+        "[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)"
+    )

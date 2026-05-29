@@ -1,0 +1,14 @@
+# Don't commit the data file — the app downloads it from Ember at runtime
+all_countries.csv
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
