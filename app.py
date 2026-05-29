@@ -675,7 +675,9 @@ with tab_heat:
                     tickfont=dict(color=COLOR_TEXT, size=11),
                     thickness=14,
                     len=0.9,
-                    xpad=10,
+                    x=1.02,           # position just outside the plot area
+                    xanchor="left",   # anchor by its left edge so width grows rightward
+                    xpad=4,
                     tickformat=",.0f",
                 ),
                 hovertemplate="Week %{x}<br>%{y}<br>Swing: €%{z:.0f} /MWh<extra></extra>",
@@ -687,7 +689,7 @@ with tab_heat:
         )
         apply_dark_theme(fig_heat, height=320)
         # Override the right margin so the colorbar isn't clipped
-        fig_heat.update_layout(margin=dict(l=10, r=80, t=10, b=10))
+        fig_heat.update_layout(margin=dict(l=10, r=110, t=30, b=10))
         st.plotly_chart(fig_heat, width="stretch")
 
         sub_avg = sub["Swing"].mean()
