@@ -930,17 +930,34 @@ with tab_bess:
     )
 
     # Duration selector
-    duration = st.radio(
-        "Battery duration",
-        options=BESS_DURATIONS,
-        index=1,  # default to 2h — the most common utility-scale spec
-        horizontal=True,
-        format_func=lambda h: f"{h}-hour",
-        help=(
-            "Hours of energy storage at rated power. A 2-hour, 10 MW battery can "
-            "discharge 10 MW for 2 hours (20 MWh delivered per full cycle)."
-        ),
-    )
+    col_dur, col_thresh = st.columns([1, 1])
+    with col_dur:
+        duration = st.radio(
+            "Battery duration",
+            options=BESS_DURATIONS,
+            index=1,  # default to 2h — the most common utility-scale spec
+            horizontal=True,
+            format_func=lambda h: f"{h}-hour",
+            help=(
+                "Hours of energy storage at rated power. A 2-hour, 10 MW battery can "
+                "discharge 10 MW for 2 hours (20 MWh delivered per full cycle)."
+            ),
+        )
+    with col_thresh:
+        threshold = st.slider(
+            "Minimum spread to dispatch (€/MWh)",
+            min_value=0,
+            max_value=200,
+            value=0,
+            step=10,
+            help=(
+                "Skip dispatching on days where the chosen-duration spread is below "
+                "this threshold. Day-ahead prices are published the day before delivery, "
+                "so operators can look at tomorrow's price curve and decide whether to "
+                "trade. Higher thresholds = more selective dispatch, fewer cycles, "
+                "higher margin per cycle but less total revenue."
+            ),
+        )
     spread_col = f"Spread_{duration}h"
 
     # Verify we have the column (sanity guard against future schema drift)
@@ -952,12 +969,18 @@ with tab_bess:
         st.stop()
 
     # Per-day daily revenue per MW (gross): spread × duration MWh × 1 cycle/day
-    # Then aggregate to annual €/MW/year by averaging daily revenue × 365
+    # Threshold filter: zero out days where the spread is below the threshold —
+    # the asset still exists on those days, it just sits idle. Days remain in
+    # the count so the annualisation still divides by the full window.
     bess_data = filtered[["Country", "ISO3 Code", "Date", spread_col]].copy()
     bess_data = bess_data.dropna(subset=[spread_col])
-    bess_data["Daily_Revenue_per_MW"] = bess_data[spread_col] * duration  # €/MW/day
+    bess_data["Dispatched"] = bess_data[spread_col] >= threshold
+    bess_data["Daily_Revenue_per_MW"] = (
+        bess_data[spread_col].where(bess_data["Dispatched"], 0) * duration
+    )
 
-    # Annualised by country — mean daily × 365 to extrapolate to a full year
+    # Annualised by country — mean daily × 365 to extrapolate to a full year.
+    # Idle days count as 0 revenue, so they pull the average down correctly.
     annual_per_country = (
         bess_data.groupby("Country")["Daily_Revenue_per_MW"]
         .mean()
@@ -967,36 +990,65 @@ with tab_bess:
         .sort_values("Annual_per_MW", ascending=False)
     )
 
+    # Dispatch stats — useful to surface when the threshold is non-zero
+    dispatch_rate = bess_data["Dispatched"].mean() * 100  # % of days the asset operated
+    total_days = len(bess_data)
+    dispatched_days = int(bess_data["Dispatched"].sum())
+    avg_spread_when_dispatched = (
+        bess_data.loc[bess_data["Dispatched"], spread_col].mean()
+        if dispatched_days > 0 else 0
+    )
+
     # Headline metrics
-    overall_avg_spread = bess_data[spread_col].mean()
-    overall_annual = overall_avg_spread * duration * 365
-    best_country = annual_per_country.iloc[0]
-    worst_country = annual_per_country.iloc[-1]
+    overall_avg_revenue = bess_data["Daily_Revenue_per_MW"].mean()
+    overall_annual = overall_avg_revenue * 365
+    if len(annual_per_country) > 0:
+        best_country = annual_per_country.iloc[0]
+        worst_country = annual_per_country.iloc[-1]
+    else:
+        best_country = worst_country = None
+
+    # If a threshold is active, show a context line
+    if threshold > 0:
+        if dispatched_days > 0:
+            st.info(
+                f"⚙️ **Threshold active:** With a minimum spread of €{threshold}/MWh, "
+                f"the battery would have dispatched on **{dispatch_rate:.0f}%** of days "
+                f"({dispatched_days:,} of {total_days:,}), capturing an average spread "
+                f"of **€{avg_spread_when_dispatched:,.0f}/MWh** on the days it ran. "
+                f"Idle days still count toward the 365-day denominator."
+            )
+        else:
+            st.warning(
+                f"⚙️ At a €{threshold}/MWh threshold, the battery would never have "
+                f"dispatched in the selected window. Lower the threshold or widen the date range."
+            )
 
     m1, m2, m3 = st.columns(3)
     m1.metric(
         f"Avg gross revenue ({duration}h BESS)",
         f"€{overall_annual:,.0f} /MW/year",
         help=(
-            f"Across all selected markets, a {duration}-hour battery would have captured "
-            f"€{overall_avg_spread:,.1f}/MWh per cycle on average. Multiplied by "
-            f"{duration} MWh per cycle and 365 cycles/year."
+            f"Across all selected markets, a {duration}-hour battery operating with a "
+            f"€{threshold}/MWh minimum-spread rule would have produced this gross annual "
+            f"revenue per MW of installed power."
         ),
     )
-    m2.metric(
-        "Best market",
-        f"{best_country['Country']}",
-        delta=f"€{best_country['Annual_per_MW']:,.0f} /MW/yr",
-        delta_color="off",
-        help="Country with the highest gross revenue per MW in the selected window.",
-    )
-    m3.metric(
-        "Worst market",
-        f"{worst_country['Country']}",
-        delta=f"€{worst_country['Annual_per_MW']:,.0f} /MW/yr",
-        delta_color="off",
-        help="Country with the lowest gross revenue per MW in the selected window.",
-    )
+    if best_country is not None:
+        m2.metric(
+            "Best market",
+            f"{best_country['Country']}",
+            delta=f"€{best_country['Annual_per_MW']:,.0f} /MW/yr",
+            delta_color="off",
+            help="Country with the highest gross revenue per MW in the selected window.",
+        )
+        m3.metric(
+            "Worst market",
+            f"{worst_country['Country']}",
+            delta=f"€{worst_country['Annual_per_MW']:,.0f} /MW/yr",
+            delta_color="off",
+            help="Country with the lowest gross revenue per MW in the selected window.",
+        )
 
     # Ranking bar chart: annual €/MW/year by country
     st.markdown("##### Annual gross revenue by market")
@@ -1061,10 +1113,17 @@ with tab_bess:
         st.markdown(
             f"""
             **What this calculates:** For each day and country, we take the actual 24 hourly
-            day-ahead prices, sort them, and assume a perfect-foresight battery charges during
-            the cheapest **{duration}** hours and discharges during the most expensive **{duration}** hours.
-            The spread captured per MWh discharged is multiplied by **{duration} MWh per cycle** and
-            **365 cycles per year** to produce annual gross revenue per MW of installed power.
+            day-ahead prices, sort them, and assume the battery charges during the cheapest
+            **{duration}** hours and discharges during the most expensive **{duration}** hours.
+            The spread captured per MWh discharged is multiplied by **{duration} MWh per cycle**
+            and **365 cycles per year** to produce annual gross revenue per MW of installed power.
+
+            **Minimum-spread rule ({"€" + str(threshold) + "/MWh" if threshold > 0 else "currently off"}):**
+            On days where the {duration}-hour spread falls below the threshold, the battery
+            doesn't dispatch — it sits idle. This is realistic because day-ahead clearing prices
+            are published at ~12:00 the day before delivery, so operators have full visibility
+            of tomorrow's price curve and can choose to skip unprofitable days. Skipped days
+            still count toward the annualisation (the asset existed; it just didn't run).
 
             **What's deliberately excluded:**
             - **Round-trip efficiency losses** (real lithium-ion BESS: ~85–90%)
@@ -1072,7 +1131,8 @@ with tab_bess:
             - **Imbalance, grid fees, taxes, balancing market participation**
             - **Auction clearing & price-taker dynamics** — assumes you can transact at the
               clearing price without moving it
-            - **Forecasting error** — assumes perfect foresight of when the daily peak/trough will be
+            - **Intra-day forecasting error within the chosen day** — once day-ahead is
+              published, we assume perfect execution of the optimal charge/discharge schedule
 
             **Why this is still a useful market-selection signal:** All the excluded factors apply
             *similarly* across markets. A market with 2× the gross arbitrage opportunity will,
